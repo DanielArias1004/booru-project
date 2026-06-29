@@ -38,27 +38,14 @@ class CanvasMixin:
 
         v.addLayout(top)
 
-        # Thumbnail carousel
-        self.carousel_container = QWidget()
-        self.carousel_layout = QHBoxLayout(self.carousel_container)
-        self.carousel_layout.setSpacing(5)
-        self.carousel_layout.setContentsMargins(0, 0, 0, 0)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setWidget(self.carousel_container)
-        scroll.setFixedHeight(120)
-        v.addWidget(scroll)
-
         # Navigation bar
+            # maybe add keyboard shortcuts, seek bar?
         nav = QHBoxLayout()
-        self.prev_btn = QPushButton("⏮")
+        self.prev_btn = QPushButton("Previous")
         self.prev_btn.clicked.connect(self.show_previous)
-        self.shuffle_btn = QPushButton("🔀")
+        self.shuffle_btn = QPushButton("Random")
         self.shuffle_btn.clicked.connect(self.show_random)
-        self.next_btn = QPushButton("⏭")
+        self.next_btn = QPushButton("Next")
         self.next_btn.clicked.connect(self.show_next)
 
         for btn in (self.prev_btn, self.shuffle_btn, self.next_btn):
@@ -126,6 +113,8 @@ class CanvasMixin:
             btn.setFixedSize(84, 84)
             btn.clicked.connect(lambda _checked, i=idx: self._on_thumb_clicked(i))
             self.carousel_layout.addWidget(btn)
+
+    # we need a tags tab on the left
 
     # — Navigation —
 

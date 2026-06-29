@@ -5,6 +5,9 @@
 import sqlite3
 import os
 from contextlib import contextmanager
+import logging
+
+logger = logging.getLogger(__name__)
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "booru.db")
 
@@ -138,16 +141,15 @@ def make_absolute_path(relative_path, base_path):
     return os.path.normpath(os.path.join(base_path, relative_path)) # normpath collapses redundant separators and converts clashes
     # use normcase for normalizing case. join will concatenate the two paths
 
-def add_image(file_path):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT OR IGNORE INTO images (file_path) VALUES (?);",
-        (file_path,)
-    )
-    conn.commit()
-    conn.close()
-
+def add_image(file_path: str) -> None:
+    try:
+        with get_db() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO images (file_path) VALUES (?);",
+                (file_path,)
+            )
+    except Exception:
+        logger.exception(f"Failed to add image {file_path} to database.")
 
 def set_favorite(image_id, is_favorite=True):
     conn = sqlite3.connect(DB_PATH)
