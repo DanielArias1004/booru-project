@@ -131,7 +131,7 @@ class FoldersMixin:
         if not os.path.isfile(path):
             return
         folder = os.path.dirname(path)
-        imgs = sorted(load_images_from_folder(folder))
+        imgs = sorted(load_images_from_folder(folder, self.base_folder))
         if path not in imgs:
             return
         self.image_paths = imgs

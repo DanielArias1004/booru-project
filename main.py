@@ -10,7 +10,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(messag
 def main():
     init_db() # initialize database (from db_handler.py)
     app = QApplication(sys.argv) # create app
-    window = ImageViewerApp() # load and show the main window (from ui_main.py)
+    window = ImageViewerApp()
     window.show()
 
     sys.exit(app.exec()) # makes it appear on screen

@@ -27,6 +27,17 @@ def get_db():
 def init_db():
     """initialize the SQLite database if it doesn't exist"""
     # create db folder if it doesnt exist
+    # shouldnt this be in the db folder
+
+    # if you want to move the stuff to schema.sql use this code block here instead
+    """
+    schema_path = os.path.join(os.path.dirname(__file__), "schema.sql")
+    with open(schema_path) as f:
+        schema = f.read()
+    with get_db() as conn:
+        conn.executescript(schema)
+    """
+
     db_dir = os.path.dirname(DB_PATH)
     if not os.path.exists(db_dir):
         os.makedirs(db_dir)
@@ -130,6 +141,8 @@ def init_db():
 
     # Future migration blocks go here (v2, v3, ...)
 
+    # INDEXES FOR PERFORMANCE
+
     conn.commit()
     conn.close()
 
@@ -150,6 +163,7 @@ def add_image(file_path: str) -> None:
             )
     except Exception:
         logger.exception(f"Failed to add image {file_path} to database.")
+    # you need to convert the rest of these functions below to use get_db() context manager for consistency and error handling
 
 def set_favorite(image_id, is_favorite=True):
     conn = sqlite3.connect(DB_PATH)

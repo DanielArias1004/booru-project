@@ -5,12 +5,13 @@ from datetime import datetime
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-    QLabel, QTextEdit, QScrollArea
+    QLabel, QTextEdit
 )
-from PySide6.QtGui import QPixmap, QIcon
-from PySide6.QtCore import Qt, QSize
+from PySide6.QtGui import QPixmap
+from PySide6.QtCore import Qt
 
 from services.db_handler import get_latest_note, add_note, get_image_id_by_path
+from ui.canvas.carousel import CarouselWidget
 
 
 class CanvasMixin:
@@ -24,12 +25,15 @@ class CanvasMixin:
         # Top: image viewer + notes panel
         top = QHBoxLayout()
 
+        # need a left panel here for tags like danbooru, gelbooru, etc. and a search bar for tags
+
         self.image_label = QLabel("No image loaded")
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setStyleSheet("background-color: #111;")
         self.image_label.setMinimumSize(600, 400)
         top.addWidget(self.image_label, stretch=3)
 
+        # need to make notes not delete on every load
         self.notes_edit = QTextEdit()
         self.notes_edit.setPlaceholderText("Enter notes here…")
         self.notes_edit.setStyleSheet("background-color: #222; color: white;")
@@ -38,8 +42,12 @@ class CanvasMixin:
 
         v.addLayout(top)
 
+        # Carousel
+        self.carousel = CarouselWidget(on_click=self._on_thumb_clicked)
+        v.addWidget(self.carousel)
+
         # Navigation bar
-            # maybe add keyboard shortcuts, seek bar?
+            # can we add ability to type in the index you want?
         nav = QHBoxLayout()
         self.prev_btn = QPushButton("Previous")
         self.prev_btn.clicked.connect(self.show_previous)
@@ -74,6 +82,7 @@ class CanvasMixin:
             return
 
         path = self.image_paths[self.current_index]
+        rel_path = os.path.relpath(path, self.base_folder)
 
         pix = QPixmap(path)
         if pix.isNull():
@@ -84,7 +93,7 @@ class CanvasMixin:
                 pix.scaled(self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
             )
 
-        image_id = get_image_id_by_path(path)
+        image_id = get_image_id_by_path(rel_path)
         self.notes_edit.setText(get_latest_note(image_id) if image_id else "")
 
         filename = os.path.basename(path)
@@ -92,51 +101,36 @@ class CanvasMixin:
             f"Image {self.current_index + 1} of {len(self.image_paths)} — {filename}"
         )
 
-        self._refresh_carousel()
+        self.carousel.refresh(self.image_paths, self.current_index)
 
-    def _clear_carousel(self) -> None:
-        """Remove all thumbnail widgets from the carousel."""
-        for i in reversed(range(self.carousel_layout.count())):
-            widget = self.carousel_layout.itemAt(i).widget()
-            if widget:
-                widget.setParent(None)
+    def resizeEvent(self, event):
+        """Re-render the image when the window is resized."""
+        super().resizeEvent(event) # super refers to the QMainWindow class in main_window.py, which the mixin is mixed into.
+        if self.image_paths: # dont try to show image if there are no images loaded
+            self.show_image()
 
-    def _refresh_carousel(self) -> None:
-        """Rebuild thumbnails for the 5 images around the current one."""
-        self._clear_carousel()
-        start = max(0, self.current_index - 2)
-        end = min(len(self.image_paths), self.current_index + 3)
-        for idx in range(start, end):
-            btn = QPushButton()
-            btn.setIcon(QIcon(self.image_paths[idx]))
-            btn.setIconSize(QSize(80, 80))
-            btn.setFixedSize(84, 84)
-            btn.clicked.connect(lambda _checked, i=idx: self._on_thumb_clicked(i))
-            self.carousel_layout.addWidget(btn)
-
-    # we need a tags tab on the left
 
     # — Navigation —
 
     def _on_thumb_clicked(self, idx: int) -> None:
-        self._save_current_note()
+        self._save_current_note() # can we instead use a timer to save it every few seconds if it's changed instead of in every function.
         self.current_index = idx
         self.show_image()
 
     def show_previous(self) -> None:
-        self._save_current_note()
+        self._save_current_note() # can we instead use a timer to save it every few seconds if it's changed instead of in every function.
         if self.image_paths:
             self.current_index = (self.current_index - 1) % len(self.image_paths)
             self.show_image()
 
     def show_next(self) -> None:
-        self._save_current_note()
+        self._save_current_note() # can we instead use a timer to save it every few seconds if it's changed instead of in every function.
         if self.image_paths:
             self.current_index = (self.current_index + 1) % len(self.image_paths)
             self.show_image()
 
     def show_random(self) -> None:
-        self._save_current_note()
+        self._save_current_note() # can we instead use a timer to save it every few seconds if it's changed instead of in every function.
         if self.image_paths:
             self.current_index = random.randrange(len(self.image_paths))
             self.show_image()
@@ -148,6 +142,7 @@ class CanvasMixin:
         if not self.image_paths:
             return
         path = self.image_paths[self.current_index]
-        image_id = get_image_id_by_path(path)
+        rel_path = os.path.relpath(path, self.base_folder)
+        image_id = get_image_id_by_path(rel_path)
         if image_id:
             add_note(image_id, self.notes_edit.toPlainText(), datetime.now().isoformat())
