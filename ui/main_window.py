@@ -44,8 +44,8 @@ class ImageViewerApp(CanvasMixin, FoldersMixin, QMainWindow):
             self.tree.setModel(self.fs_model)
             self.tree.setRootIndex(self.fs_model.index(self.base_folder))
             self.refresh_folders()
+            self.load_all_images() # load all images on startup
 
-        self.load_all_images() # load all images on app load
 
         # keyboard shortcuts for navigation
         QShortcut(QKeySequence("Left"), self, self.show_previous)
@@ -55,11 +55,11 @@ class ImageViewerApp(CanvasMixin, FoldersMixin, QMainWindow):
 
     def on_tab_changed(self, idx: int) -> None:
         if self.tabs.tabText(idx) == "Canvas": # fragile, may need to make constants like TAB_CANVAS = 0 and use that. if the tab name changes, it will break.
-            self.load_all_images()
+            self.show_image() # no longer rescans automatically since paths are already populated. just refresh the image/carousel in case notes changed
 
     # this needs to not load all images at once or 
     def load_all_images(self) -> None:
-        """Collect all images from staged folders and display the first one."""
+        """Collect all images from staged folders and display images from them all."""
         if not self.base_folder:
             return
         paths = []

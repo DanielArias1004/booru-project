@@ -29,7 +29,7 @@ class FoldersMixin:
         change_btn.clicked.connect(self.prompt_for_base_folder)
         layout.addWidget(change_btn)
 
-        # Content: left panel (saved folders) + right panel (file tree)
+        # Content: left panel (staged folders) + right panel (file tree)
         content_layout = QHBoxLayout()
 
         # Left: add/remove buttons + saved folder list
@@ -71,12 +71,10 @@ class FoldersMixin:
         if not index.isValid():
             QMessageBox.warning(self, "No folder selected", "Please select a folder in the tree view.")
             return
-
         abs_path = self.fs_model.filePath(index)
         if not os.path.isdir(abs_path):
             QMessageBox.warning(self, "Invalid selection", "Please select a folder, not a file.")
             return
-
         rel = os.path.relpath(abs_path, self.base_folder)
         if rel in get_folders():
             QMessageBox.information(self, "Already added", "This folder is already in your list.")
@@ -84,6 +82,7 @@ class FoldersMixin:
 
         add_folder(rel)
         self.refresh_folders()
+        self.load_all_images() # rescan since folder set changed
 
     def _ui_remove_folder(self) -> None:
         """Remove the currently selected saved folder from the DB."""
@@ -91,6 +90,7 @@ class FoldersMixin:
         if item:
             remove_folder(item.text())
             self.refresh_folders()
+            self.load_all_images() # rescan since folder set changed
 
     def refresh_folders(self) -> None:
         """Reload the saved folders list from the DB."""

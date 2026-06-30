@@ -53,8 +53,9 @@ class CarouselWidget(QWidget):
             if w:
                 w.setParent(None)
 
-        start = max(0, current_index - 2)
-        end = min(len(image_paths), current_index + 3)
+        # can we make the carousel expand based on the window width?
+        start = max(0, current_index - 3)
+        end = min(len(image_paths), current_index + 4)
         for idx in range(start, end): # for every image in the carousel
             path = image_paths[idx] # get the path for it
             is_current = (idx == current_index)

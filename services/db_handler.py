@@ -165,6 +165,19 @@ def add_image(file_path: str) -> None:
         logger.exception(f"Failed to add image {file_path} to database.")
     # you need to convert the rest of these functions below to use get_db() context manager for consistency and error handling
 
+def add_images_batch(file_paths: list[str]) -> None:
+    """Insert many image paths in a single transaction — much faster than one-by-one."""
+    if not file_paths:
+        return
+    try:
+        with get_db() as conn:
+            conn.executemany(
+                "INSERT OR IGNORE INTO images (file_path) VALUES (?);",
+                [(p,) for p in file_paths]
+            )
+    except Exception:
+        logger.exception("Failed to batch-insert %d images", len(file_paths))
+
 def set_favorite(image_id, is_favorite=True):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()

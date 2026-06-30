@@ -2,15 +2,15 @@
 
 import os
 import glob # for path navigation
-from services.db_handler import add_image
+from services.db_handler import add_images_batch
 
 # Supported image extensions
 IMAGE_EXTENSIONS = ['*.jpg', '*.jpeg', '*.png', '*.webp', '*.gif', '*.bmp', '*.tiff']
 
 def load_images_from_folder(folder_path: str, base_folder: str) -> list[str]: 
     """
-    Scans the given folder (and subfolders) for images, adds each to the DB,
-    and returns a list of all absolute image file paths found.
+    Scans the given folder (and subfolders) for image paths only (no decoding).
+    Batches the new paths into the DB in a signle transaction, and returns absolute paths.
     """
     # take in folder_path (abs path of selected folder within base folder i.e. hncl) and base_folder (abs path of base folder i.e. saved art) so we can find and store relative paths in the DB for portability
     # ^ but base folder is already stored in the config file, so we can just get it from there instead of passing it in. but passing it in makes the function more flexible and testable, so maybe keep it that way.
@@ -21,9 +21,8 @@ def load_images_from_folder(folder_path: str, base_folder: str) -> list[str]:
         all_images.extend(found)
 
     # Add to DB and return unique list
-    unique_paths = set(all_images)
-    for path in unique_paths:
-        rel = os.path.relpath(path, base_folder)
-        add_image(rel)  # store relative path in DB for portability
+    unique_paths = sorted(set(all_images))
+    rel_paths = [os.path.relpath(p, base_folder) for p in unique_paths] # list comprehension here is faster than using a for loop, and more pythonic. stores relative paths into a list.
+    add_images_batch(rel_paths)  # store list in DB, one transaction for all new images (instead of a new transaction for every iteration of a for loop). we use relative paths for portability.
 
-    return sorted(set(all_images)) # or return list(unique_paths)
+    return unique_paths  # return absolute paths for display in the UI

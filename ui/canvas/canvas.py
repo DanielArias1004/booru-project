@@ -78,15 +78,15 @@ class CanvasMixin:
             self.index_label.setText("No images loaded")
             self.image_label.setText("No image loaded")
             self.notes_edit.clear()
-            self._clear_carousel()
+            self.carousel.clear()
             return
 
         path = self.image_paths[self.current_index]
         rel_path = os.path.relpath(path, self.base_folder)
 
-        pix = QPixmap(path)
-        if pix.isNull():
-            # File exists on disk but Qt couldn't decode it (corrupt, unsupported format, etc.)
+        pix = QPixmap(path) # loads a full resolution image into a qpixmap every time the user navigates to a new image.
+            # we should scan paths eagerly but only decode/display images near the current index.
+        if pix.isNull(): # File exists on disk but Qt couldn't decode it (corrupt, unsupported format, etc.)
             self.image_label.setText(f"Cannot display: {os.path.basename(path)}")
         else:
             self.image_label.setPixmap(
