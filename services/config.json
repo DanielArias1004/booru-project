@@ -1,3 +1,5 @@
 {
-  "base_folder": "C:/Users/arias/OneDrive/art/saved art"
+  "base_folders": [
+    "C:/Users/arias/OneDrive/art/saved art"
+  ]
 }

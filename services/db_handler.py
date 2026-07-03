@@ -139,7 +139,36 @@ def init_db():
         cur.execute("PRAGMA user_version = 1;") # schema versioning
         conn.commit()
 
-    # Future migration blocks go here (v2, v3, ...)
+    # === Version 2: ===
+    if current_version < 2:
+        # Add base_folder column to folders table.
+        # We use a default of "" so existing rows don't break —
+        # they'll be associated with whichever base folder the user
+        # still has configured, which load_all_images handles gracefully.
+        cur.execute("""
+            ALTER TABLE folders ADD COLUMN base_folder TEXT NOT NULL DEFAULT '';
+        """)
+
+        # drop the old unique constraint on path alone and add a new
+        # composite unique constraint so the same relative path can exist
+        # under two different base folders
+        cur.execute("""
+            CREATE TABLE folders_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                base_folder TEXT NOT NULL,
+                path TEXT NOT NULL,
+                UNIQUE(base_folder, path)
+            );
+        """)
+        cur.execute("""
+            INSERT OR IGNORE INTO folders_new (base_folder, path)
+            SELECT base_folder, path FROM folders;
+        """)
+        cur.execute("DROP TABLE folders;")
+        cur.execute("ALTER TABLE folders_new RENAME TO folders;")
+
+        cur.execute("PRAGMA user_version = 2;")
+        conn.commit()
 
     # INDEXES FOR PERFORMANCE
 
@@ -225,28 +254,27 @@ def get_latest_note(image_id):
     return row[0] if row else ''
 
 
-def add_folder(relative_path):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT OR IGNORE INTO folders (path) VALUES (?);",
-        (relative_path,)
-    )
-    conn.commit()
-    conn.close()
-
-def remove_folder(relative_path: str) -> None:
-    """Remove a saved folder from the DB by its relative path."""
+def add_folder(base_folder: str, relative_path: str) -> None:
     with get_db() as conn:
-        conn.execute("DELETE FROM folders WHERE path = ?;", (relative_path,))
+        conn.execute(
+            "INSERT OR IGNORE INTO folders (base_folder, path) VALUES (?, ?);",
+            (base_folder, relative_path)
+        )
 
-def get_folders():
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT path FROM folders;")
-    rows = cur.fetchall()
-    conn.close()
-    return [r[0] for r in rows]
+def remove_folder(base_folder: str, relative_path: str) -> None:
+    with get_db() as conn:
+        conn.execute(
+            "DELETE FROM folders WHERE base_folder = ? AND path = ?;",
+            (base_folder, relative_path)
+        )
+
+def get_folders() -> list[tuple[str, str]]:
+    """Returns list of (base_folder, relative_path) tuples."""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT base_folder, path FROM folders;"
+        ).fetchall()
+    return [(r[0], r[1]) for r in rows]
 
 def add_tag(name, tag_type=None):
     conn = sqlite3.connect(DB_PATH)

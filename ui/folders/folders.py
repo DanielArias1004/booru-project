@@ -1,5 +1,6 @@
 # viewer/folders.py
 import os
+from turtle import left
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
@@ -7,9 +8,9 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtWidgets import QFileSystemModel
 
-from services.db_handler import add_folder, get_folders, remove_folder
-from services.config_handler import set_base_folder
 from services.image_loader import load_images_from_folder
+from services.config_handler import get_base_folders, add_base_folder, remove_base_folder
+from services.db_handler import add_folder, remove_folder, get_folders
 
 
 class FoldersMixin:
@@ -20,13 +21,28 @@ class FoldersMixin:
         tab = QWidget()
         layout = QVBoxLayout(tab)
 
+        # Base folder management bar
+        base_bar = QHBoxLayout()
+        add_base_btn = QPushButton("+ Add Base Folder")
+        add_base_btn.clicked.connect(self.prompt_add_base_folder)
+        base_bar.addWidget(add_base_btn)
+        base_bar.addStretch()
+        layout.addLayout(base_bar)
+
+        # base folders list (shows all base folders with remove buttons)
+        self.base_folder_list = QWidget()
+        self.base_folder_list_layout = QVBoxLayout(self.base_folder_list)
+        self.base_folder_list_layout.setContentsMargins(0, 0, 0, 0)
+        self.base_folder_list_layout.setSpacing(2)
+        layout.addWidget(self.base_folder_list)
+
         # Breadcrumb path bar
         self.breadcrumb_bar = QHBoxLayout()
         self.breadcrumb_bar.setSpacing(5)
         layout.addLayout(self.breadcrumb_bar)
 
         change_btn = QPushButton("Change Base Folder")
-        change_btn.clicked.connect(self.prompt_for_base_folder)
+        change_btn.clicked.connect(self.prompt_add_base_folder)
         layout.addWidget(change_btn)
 
         # Content: left panel (staged folders) + right panel (file tree)
@@ -35,30 +51,26 @@ class FoldersMixin:
         # Left: add/remove buttons + saved folder list
         left = QVBoxLayout()
         btn_row = QHBoxLayout()
-        add_btn = QPushButton("+")
-        add_btn.setToolTip("Save selected folder to your list")
+        add_btn = QPushButton("+ Stage")
+        add_btn.setToolTip("Stage selected folder")
         add_btn.clicked.connect(self._ui_add_folder)
-        rem_btn = QPushButton("–")
-        rem_btn.setToolTip("Remove selected folder from your list")
-        rem_btn.clicked.connect(self._ui_remove_folder)
         btn_row.addWidget(add_btn)
-        btn_row.addWidget(rem_btn)
+        btn_row.addStretch()
         left.addLayout(btn_row)
 
         self.folder_list = QListWidget()
-        self.folder_list.itemClicked.connect(self._on_folder_selected)
         left.addWidget(self.folder_list)
 
         # Right: file system tree
         self.fs_model = QFileSystemModel()
-        self.fs_model.setNameFilters(["*.jpg", "*.jpeg", "*.png", "*.bmp", "*.gif"])
+        self.fs_model.setNameFilters(["*.jpg", "*.jpeg", "*.png", "*.webp", "*.bmp", "*.gif"])
         self.fs_model.setNameFilterDisables(False)
 
         self.tree = QTreeView()
         self.tree.doubleClicked.connect(self._on_file_double_clicked)
 
-        content_layout.addLayout(left, stretch=1)
-        content_layout.addWidget(self.tree, stretch=3)
+        content_layout.addLayout(left, 1)
+        content_layout.addWidget(self.tree, 3)
         layout.addLayout(content_layout)
 
         return tab
@@ -66,54 +78,80 @@ class FoldersMixin:
     # — Folder list management —
 
     def _ui_add_folder(self) -> None:
-        """Save the currently selected tree folder to the DB."""
         index = self.tree.currentIndex()
         if not index.isValid():
-            QMessageBox.warning(self, "No folder selected", "Please select a folder in the tree view.")
+            QMessageBox.warning(self, "No folder selected", "Please select a folder in the tree.")
             return
+
         abs_path = self.fs_model.filePath(index)
         if not os.path.isdir(abs_path):
             QMessageBox.warning(self, "Invalid selection", "Please select a folder, not a file.")
             return
-        rel = os.path.relpath(abs_path, self.base_folder)
-        if rel in get_folders():
-            QMessageBox.information(self, "Already added", "This folder is already in your list.")
+
+        # figure out which base folder this path belongs to
+        base = self._get_base_folder_for_path(abs_path)
+        if not base:
+            QMessageBox.warning(self, "Outside base folders",
+                "Selected folder is not inside any of your base folders.")
             return
 
-        add_folder(rel)
-        self.refresh_folders()
-        self.load_all_images() # rescan since folder set changed
+        rel = os.path.relpath(abs_path, base)
+        existing = [(b, p) for b, p in get_folders() if b == base and p == rel]
+        if existing:
+            QMessageBox.information(self, "Already staged", "This folder is already staged.")
+            return
 
-    def _ui_remove_folder(self) -> None:
-        """Remove the currently selected saved folder from the DB."""
-        item = self.folder_list.currentItem()
-        if item:
-            remove_folder(item.text())
-            self.refresh_folders()
-            self.load_all_images() # rescan since folder set changed
+        add_folder(base, rel)
+        self.refresh_folders() # refresh since the staged folder list has changed
+        self.load_all_images()
 
     def refresh_folders(self) -> None:
-        """Reload the saved folders list from the DB."""
+        """Rebuild the staged folders list with inline remove buttons."""
         self.folder_list.clear()
-        for path in get_folders():
-            self.folder_list.addItem(path)
+        for base, rel in get_folders():
+            self.folder_list.addItem(f"[{os.path.basename(base)}] {rel}")
 
-    def prompt_for_base_folder(self) -> None:
-        """Open a dialog to pick a new base folder, then update all state."""
-        folder = QFileDialog.getExistingDirectory(self, "Choose Base Folder")
+    def refresh_base_folders(self) -> None:
+        """Rebuild the base folders display with remove buttons."""
+        for i in reversed(range(self.base_folder_list_layout.count())):
+            w = self.base_folder_list_layout.itemAt(i).widget()
+            if w:
+                w.setParent(None)
+
+        for base in self.base_folders:
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+
+            label = QLabel(base)
+            label.setStyleSheet("font-weight: bold; padding: 2px 4px;")
+            row_layout.addWidget(label, stretch=1)
+
+            rem_btn = QPushButton("✕")
+            rem_btn.setFixedSize(24, 24)
+            rem_btn.setToolTip("Remove this base folder")
+            rem_btn.clicked.connect(lambda _checked, b=base: self._remove_base_folder(b))
+            row_layout.addWidget(rem_btn)
+
+            self.base_folder_list_layout.addWidget(row)
+
+    def prompt_add_base_folder(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "Add Base Folder")
         if not folder:
-            return  # user cancelled
-
-        self.base_folder = folder
-        set_base_folder(folder)
-
-        self.fs_model.setRootPath(self.base_folder)
-        self.tree.setModel(self.fs_model)
-        self.tree.setRootIndex(self.fs_model.index(self.base_folder))
+            return
+        add_base_folder(folder)
+        self.base_folders = get_base_folders()
+        self.refresh_base_folders()
+        self._init_tree()
         self.refresh_folders()
+        self.load_all_images()
 
-        if self.tabs.tabText(self.tabs.currentIndex()) == "Canvas":
-            self.load_all_images()
+    def _remove_base_folder(self, base: str) -> None:
+        remove_base_folder(base)
+        self.base_folders = get_base_folders()
+        self.refresh_base_folders()
+        self.refresh_folders()
+        self.load_all_images()
 
     # — Tree navigation —
 

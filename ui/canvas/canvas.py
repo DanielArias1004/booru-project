@@ -72,6 +72,17 @@ class CanvasMixin:
 
     # — Display —
 
+    def _get_base_folder_for_path(self, abs_path: str) -> str | None:
+        """Find which base folder this image lives under."""
+        for base in self.base_folders:
+            try:
+                rel = os.path.relpath(abs_path, base)
+                if not rel.startswith(".."): # relpath returns something starting with '..' if path is outside base
+                    return base
+            except ValueError: # on Windows, relpath raises ValueError for paths on different drives
+                continue
+        return None
+
     def show_image(self) -> None:
         """Render the current image, load its note, and refresh the carousel."""
         if not self.image_paths:
@@ -81,8 +92,9 @@ class CanvasMixin:
             self.carousel.clear()
             return
 
-        path = self.image_paths[self.current_index]
-        rel_path = os.path.relpath(path, self.base_folder)
+        path = self.image_paths[self.current_index] # get the absolute path of the current image
+        base = self._get_base_folder_for_path(path) # get the base folder for this image, so we can store the relative path in the DB
+        rel_path = os.path.relpath(path, base) if base else path
 
         pix = QPixmap(path) # loads a full resolution image into a qpixmap every time the user navigates to a new image.
             # we should scan paths eagerly but only decode/display images near the current index.
@@ -142,7 +154,8 @@ class CanvasMixin:
         if not self.image_paths:
             return
         path = self.image_paths[self.current_index]
-        rel_path = os.path.relpath(path, self.base_folder)
+        base = self._get_base_folder_for_path(path)
+        rel_path = os.path.relpath(path, base) if base else path
         image_id = get_image_id_by_path(rel_path)
         if image_id:
             add_note(image_id, self.notes_edit.toPlainText(), datetime.now().isoformat())
