@@ -6,8 +6,8 @@ from datetime import datetime
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QTextEdit
 )
-from PySide6.QtGui import QPixmap, QKeySequence, QShortcut
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QPixmap, QKeySequence, QShortcut, QMovie, QImageReader
+from PySide6.QtCore import Qt, Signal, QSize
 
 from services.db_handler import get_latest_note, add_note, get_image_id_by_path
 from ui.canvas.carousel import CarouselWidget
@@ -21,6 +21,7 @@ class CanvasWidget(QWidget):
         super().__init__(parent)
         self._image_paths: list[str] = []
         self._current_index: int = 0
+        self._current_movie: QMovie | None = None
         self._base_folders: list[str] = []
         self._build_ui()
 
@@ -91,6 +92,11 @@ class CanvasWidget(QWidget):
         self._current_index = index
         self._show_image()
 
+    def _is_animated(self, path: str) -> bool: 
+        """Check if a file has more than one frame (animated GIF or WebP)."""
+        reader = QImageReader(path)
+        return reader.imageCount() > 1
+
     def _show_image(self) -> None:
         if not self._image_paths:
             self._index_label.setText("No images loaded")
@@ -101,13 +107,39 @@ class CanvasWidget(QWidget):
 
         path = self._image_paths[self._current_index]
 
-        pix = QPixmap(path)
-        if pix.isNull():
-            self._image_label.setText(f"Cannot display: {os.path.basename(path)}")
+        # Stop any currently playing animation before loading something new.
+        # Otherwise the old QMovie keeps running and emitting frameChanged signals even after we've moved to a new image.
+        if self._current_movie:
+            self._current_movie.stop()
+            self._current_movie = None
+
+        # correct version of the animated branch:
+        if self._is_animated(path):
+            movie = QMovie(path)
+            self._current_movie = movie
+
+            # Read the natural size of the first frame so we can scale it
+            reader = QImageReader(path)
+            natural_size = reader.size()  # returns QSize(width, height)
+
+            if natural_size.isValid():
+                scaled = natural_size.scaled(
+                    self._image_label.size(), Qt.KeepAspectRatio
+                )
+                movie.setScaledSize(scaled)
+
+            self._image_label.setMovie(movie)
+            movie.start()
         else:
-            self._image_label.setPixmap(
-                pix.scaled(self._image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            )
+            # Static image — use QPixmap as before
+            self._current_movie = None
+            pix = QPixmap(path)
+            if pix.isNull():
+                self._image_label.setText(f"Cannot display: {os.path.basename(path)}")
+            else:
+                self._image_label.setPixmap(
+                    pix.scaled(self._image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                )
 
         image_id = get_image_id_by_path(path)
         self._notes_edit.setText(get_latest_note(image_id) if image_id else "")
@@ -120,6 +152,8 @@ class CanvasWidget(QWidget):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        if not self.isVisible():
+            return
         if self._image_paths:
             self._show_image()
 

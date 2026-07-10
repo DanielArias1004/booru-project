@@ -19,8 +19,8 @@ THUMB_SIZES = {
     "medium": 150,
     "large":  250,
 }
-
-BATCH_SIZE = 50  # images loaded per scroll batch
+MAX_CONCURRENT = 8  # never decode more than this many images simultaneously
+BATCH_SIZE = MAX_CONCURRENT  # images loaded per scroll batch
 
 
 class BrowseWidget(QWidget):
@@ -39,6 +39,9 @@ class BrowseWidget(QWidget):
         self._thumb_cache: dict[str, QPixmap] = {} # stores QPixmap (converted on main thread) for each path
 
         self._pool = QThreadPool.globalInstance()  # shared thread pool for background tasks
+        self._load_generation: int = 0  # increments every time we start a fresh load. helps us ignore stale background tasks that finish after a new load has started.
+        
+        self._active_tasks: list[ThumbLoader] = []  # track in-flight tasks for cancellation
 
         # We use a QTimer to debounce scroll events (only load more images after user stops scrolling for 100ms)
         self._load_timer = QTimer()
@@ -104,6 +107,8 @@ class BrowseWidget(QWidget):
 
     def reload_images(self) -> None:
         """Re-scan all base folders and rebuild the grid from scratch."""
+        self._cancel_all_tasks()  # ← stop everything in flight
+        self._load_generation += 1  # ← invalidate all in-flight tasks
         self._all_paths = []
         for base in get_base_folders():
             if os.path.isdir(base):
@@ -122,11 +127,9 @@ class BrowseWidget(QWidget):
 
     def _load_next_batch(self) -> None:
         """Dispatch background load tasks for the next BATCH_SIZE images."""
-        if self._loaded_count >= len(self._all_paths):
-            # all images loaded — nothing more to do
+        if self._loaded_count >= len(self._all_paths): # all images loaded — nothing more to do
             return
-        if self._pending > 0:
-            # already loading — don't stack up duplicate batches
+        if self._pending >= MAX_CONCURRENT: # too much work in flight already — wait for some to finish
             return
 
         end = min(self._loaded_count + BATCH_SIZE, len(self._all_paths))
@@ -140,16 +143,28 @@ class BrowseWidget(QWidget):
                 continue
 
             # dispatch to background thread
-            task = ThumbLoader(i, path, self._thumb_size)
+            task = ThumbLoader(i, path, self._thumb_size, self._load_generation)
             task.signals.ready.connect(self._on_thumb_ready)
+            self._active_tasks.append(task)
             self._pending += 1
             self._pool.start(task)
 
         self._loaded_count = end
 
+    def _cancel_all_tasks(self) -> None:
+        """Cancel all in-flight and queued tasks."""
+        for task in self._active_tasks:
+            try:
+                task.signals.ready.disconnect(self._on_thumb_ready)
+            except RuntimeError:
+                pass  # already disconnected
+            task.cancel()
+        self._active_tasks.clear()
+        self._pending = 0
+
     def _make_thumb_button(self, path: str, index: int) -> QPushButton:
-        """Create a single thumbnail button for the grid."""
-        if path not in self._thumb_cache:
+        """Create a single thumbnail button for the grid. You can click these buttons to enter canvas view."""
+        if path not in self._thumb_cache: # decode and cache the thumbnail if we haven't already
             raw = QPixmap(path)
             if raw.isNull():
                 raw = QPixmap(self._thumb_size, self._thumb_size)
@@ -163,7 +178,6 @@ class BrowseWidget(QWidget):
                 Qt.IgnoreAspectRatio, Qt.SmoothTransformation
             )
             self._thumb_cache[path] = cropped
-
         btn = QPushButton()
         btn.setIcon(QIcon(self._thumb_cache[path]))
         btn.setIconSize(QSize(self._thumb_size, self._thumb_size))
@@ -197,8 +211,14 @@ class BrowseWidget(QWidget):
         self._grid.addWidget(btn, row, col)
 
     # _on_thumb_ready — receives QImage from worker, converts to QPixmap here on main thread
-    def _on_thumb_ready(self, index: int, path: str, image: QImage) -> None:
-        self._pending -= 1
+    def _on_thumb_ready(self, index: int, path: str, image: QImage, generation: int) -> None:
+        if generation != self._load_generation: # old generation, ignore
+            return
+            
+        self._pending = max(0, self._pending - 1)
+
+        # remove this task from active list now that it's done
+        self._active_tasks = [t for t in self._active_tasks if t.generation == self._load_generation]
         
         # convert to QPixmap here, on the main thread
         pixmap = QPixmap.fromImage(image)
@@ -207,15 +227,22 @@ class BrowseWidget(QWidget):
 
         if self._pending == 0:
             self._fill_viewport_if_needed()
+            # after a batch finishes, check if we're still near the bottom and need more.
+            bar = self._scroll.verticalScrollBar()
+            if bar.maximum() == 0: # no scrollbar yet
+                return
+            if bar.value() >= bar.maximum() - 300:
+                self._load_timer.start()
 
     def _on_scroll(self, value: int) -> None:
         """Called every time the scroll position changes."""
+        if self._pending > 0: # already loading, don't queue another batch yet
+            return
         bar = self._scroll.verticalScrollBar()
         # if we're within 300px of the bottom, queue a batch load
         if value >= bar.maximum() - 300:
             # debounce: restart the timer instead of calling directly.
-            # this prevents _load_next_batch from firing 20 times
-            # in one scroll gesture
+            # this prevents _load_next_batch from firing 20 times in one scroll gesture
             self._load_timer.start()
 
     def _fill_viewport_if_needed(self) -> None:
@@ -233,37 +260,34 @@ class BrowseWidget(QWidget):
 
     def _set_thumb_size(self, size: int) -> None:
         """Change the thumbnail size and rebuild the grid."""
-        if size == self._thumb_size:
-            return  # nothing to do — user clicked the already-active size
-    
+        if size == self._thumb_size: # user clicked the already-active size
+            return
+        self._cancel_all_tasks()  # sets cancel flag on all tasks, clears list, sets _pending = 0
+        self._load_generation += 1  # when a new load is started, invalidate all in-flight tasks by incrementing the generation counter
         self._thumb_size = size
         self._thumb_cache.clear() # cached pixmaps are no longer valid at the new size, clear them
-        self._loaded_count = 0
-        self._pending = 0  # abandon any in-flight loads (they'll be ignored when they arrive since cache is cleared)
 
-        # instead of destroying widgets, just tell each one to resize and re-decode in the background at the new size
-        for i in range(self._grid.count()):
+        # clear all existing widgets from the grid
+        for i in reversed(range(self._grid.count())):
             w = self._grid.itemAt(i).widget()
             if w:
-                w.setFixedSize(size + 4, size + 4)
-                w.setIconSize(QSize(size, size))
+                w.setParent(None)
 
-        # re-decode all visible thumbnails at new size in the background
-        for i in range(self._loaded_count):
-            path = self._all_paths[i]
-            task = ThumbLoader(i, path, self._thumb_size)
-            task.signals.ready.connect(self._on_thumb_ready)
-            self._pending += 1
-            self._pool.start(task)
+        # reset and reload from scratch at the new size
+        self._loaded_count = 0
+        self._load_next_batch()
+        # resizing instead of rebuilding the grid would be more efficient, but it's more complex to implement and not worth the effort for this prototype.
 
     def resizeEvent(self, event) -> None:
         """Reflow the grid when the window is resized."""
         super().resizeEvent(event)
-        # reflow by rebuilding — same as size change
-        # we keep _thumb_cache so no re-decoding needed
+        if not self.isVisible():  # don't reflow if we're not the active page
+            return
+        self._cancel_all_tasks()  # cancel any in-flight tasks, since the grid is about to be rebuilt
+        self._load_generation += 1  # invalidate all in-flight tasks
         self._loaded_count = 0
         for i in reversed(range(self._grid.count())):
             w = self._grid.itemAt(i).widget()
             if w:
                 w.setParent(None)
-        self._load_next_batch()
+        self._load_next_batch() 
