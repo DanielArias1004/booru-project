@@ -1,293 +1,394 @@
 # ui/browse/browse_widget.py
 import os
-import math
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-    QScrollArea, QGridLayout, QLabel, QSizePolicy
+    QListView, QAbstractItemView, QLabel, QStackedWidget
 )
-from PySide6.QtGui import QPixmap, QIcon, QImage
-from PySide6.QtCore import Qt, QSize, Signal, QTimer, QThreadPool
+from PySide6.QtCore import Qt, Signal, QTimer, QSize
 
 from services.config_handler import get_base_folders
 from services.image_loader import load_images_from_folder
-from ui.settings_dialog import SettingsDialog
-from ui.browse.thumb_loader import ThumbLoader
+from ui.browse.image_grid_model import ImageGridModel
+from ui.settings_widget import SettingsWidget
 
-# Thumbnail size presets (width and height in pixels)
 THUMB_SIZES = {
-    "small":  50,
+    "small":  100,
     "medium": 150,
     "large":  250,
 }
-MAX_CONCURRENT = 8  # never decode more than this many images simultaneously
-BATCH_SIZE = MAX_CONCURRENT  # images loaded per scroll batch
+
+# page indices — use these constants everywhere instead of magic numbers
+PAGE_BROWSE    = 0
+PAGE_FAVORITES = 1
+PAGE_ARTISTS   = 2
+PAGE_TAGS      = 3
+PAGE_POOLS     = 4
+PAGE_HELP      = 5
+PAGE_SETTINGS  = 6
 
 
 class BrowseWidget(QWidget):
-    # Signal emitted when user clicks an image.
-    # Carries the full image path list and the clicked index
-    # so canvas can show the right image with correct prev/next context.
     image_activated = Signal(list, int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-
-        self._all_paths: list[str] = [] # all discovered image paths
-        self._loaded_count: int = 0 # how many thumbnails are rendered so far
-        self._pending: int = 0 # how many background loads are currently in-flight
         self._thumb_size: int = THUMB_SIZES["medium"]
-        self._thumb_cache: dict[str, QPixmap] = {} # stores QPixmap (converted on main thread) for each path
+        self._pending_size: int = self._thumb_size
+        self._nav_buttons: dict[str, QPushButton] = {}
 
-        self._pool = QThreadPool.globalInstance()  # shared thread pool for background tasks
-        self._load_generation: int = 0  # increments every time we start a fresh load. helps us ignore stale background tasks that finish after a new load has started.
-        
-        self._active_tasks: list[ThumbLoader] = []  # track in-flight tasks for cancellation
+        self._resize_timer = QTimer()
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.setInterval(150)
+        self._resize_timer.timeout.connect(self._apply_thumb_size)
 
-        # We use a QTimer to debounce scroll events (only load more images after user stops scrolling for 100ms)
-        self._load_timer = QTimer()
-        self._load_timer.setSingleShot(True)
-        self._load_timer.setInterval(100)  # 100ms debounce
-        self._load_timer.timeout.connect(self._load_next_batch)
+        self._visible_timer = QTimer()
+        self._visible_timer.setSingleShot(True)
+        self._visible_timer.setInterval(50)
+        self._visible_timer.timeout.connect(self._load_visible)
 
+        self._model = ImageGridModel()
         self._build_ui()
         self.reload_images()
 
+    # — UI construction —
+
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        layout.addWidget(self._build_nav_bar())
+
+        self._stack = QStackedWidget()
+        self._stack.addWidget(self._build_browse_page())   # PAGE_BROWSE
+        self._stack.addWidget(self._build_stub_page(       # PAGE_FAVORITES
+            "Favorites", "♥",
+            "Your favorited images will appear here.\n"
+            "Use the ♥ button in the canvas to favorite an image."
+        ))
+        self._stack.addWidget(self._build_stub_page(       # PAGE_ARTISTS
+            "Artists", "🎨",
+            "Artists will appear here once you tag images with artist names."
+        ))
+        self._stack.addWidget(self._build_stub_page(       # PAGE_TAGS
+            "Tags", "🏷",
+            "All tags will appear here once you start tagging images."
+        ))
+        self._stack.addWidget(self._build_stub_page(       # PAGE_POOLS
+            "Pools", "📁",
+            "Pools let you group images into playlists or moods.\nComing soon."
+        ))
+        self._stack.addWidget(self._build_help_page())     # PAGE_HELP
+
+        self._settings_widget = SettingsWidget()
+        self._settings_widget.folders_changed.connect(self.reload_images)
+        self._stack.addWidget(self._settings_widget)       # PAGE_SETTINGS
+
+        layout.addWidget(self._stack)
+        self._switch_page("Browse")
+
+    def _build_nav_bar(self) -> QWidget:
+        bar = QWidget()
+        bar.setFixedHeight(44)
+        bar.setStyleSheet(
+            "background: #141414;"
+            "border-bottom: 1px solid #2a2a2a;"
+        )
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(16, 0, 16, 0)
+        layout.setSpacing(0)
+
+        title = QLabel("JiBooru")
+        title.setStyleSheet(
+            "color: #5fa8ff; font-weight: bold;"
+            "font-size: 15px; padding-right: 24px;"
+        )
+        layout.addWidget(title)
+
+        pages = [
+            ("Browse",    "🖼"),
+            ("Favorites", "♥"),
+            ("Artists",   "🎨"),
+            ("Tags",      "🏷"),
+            ("Pools",     "📁"),
+            ("Help",      "❓"),
+            ("Settings",  "⚙"),
+        ]
+
+        btn_style = """
+            QPushButton {
+                background: transparent;
+                color: #888;
+                border: none;
+                border-bottom: 3px solid transparent;
+                padding: 0 14px;
+                font-size: 13px;
+                height: 44px;
+            }
+            QPushButton:checked {
+                color: white;
+                border-bottom: 3px solid #5fa8ff;
+            }
+            QPushButton:hover:!checked {
+                color: #ddd;
+            }
+        """
+
+        for name, icon in pages:
+            btn = QPushButton(f"{icon}  {name}")
+            btn.setCheckable(True)
+            btn.setFixedHeight(44)
+            btn.setStyleSheet(btn_style)
+            btn.clicked.connect(lambda _, n=name: self._switch_page(n))
+            self._nav_buttons[name] = btn
+            layout.addWidget(btn)
+
+        layout.addStretch()
+        return bar
+
+    def _build_browse_page(self) -> QWidget:
+        page = QWidget()
+        page_layout = QHBoxLayout(page)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        page_layout.setSpacing(0)
+
+        # Left tag sidebar
+        from ui.tag_sidebar import TagSidebar
+        self._tag_sidebar = TagSidebar()
+        self._tag_sidebar.tag_clicked.connect(self._on_tag_filter)
+        self._tag_sidebar.search_submitted.connect(self._on_tag_search)
+        page_layout.addWidget(self._tag_sidebar)
+
+        # Right: size controls + grid
+        right = QWidget()
+        layout = QVBoxLayout(right)
         layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
 
-        # — Top bar —
+        # total count label
+        self._total_label = QLabel("0 images")
+        self._total_label.setStyleSheet("color: #666; font-size: 11px;")
+
         top_bar = QHBoxLayout()
-
-        # View size buttons (small / medium / large)
-        # We use text labels for now; you could swap these for QIcons later
         for size_name, size_px in THUMB_SIZES.items():
             btn = QPushButton(size_name.capitalize())
             btn.setFixedHeight(28)
-            # clicking captures size_px in a closure
-            btn.clicked.connect(
-                lambda _checked, s=size_px: self._set_thumb_size(s)
-            )
+            btn.clicked.connect(lambda _, s=size_px: self._set_thumb_size(s))
             top_bar.addWidget(btn)
-
-        top_bar.addStretch()  # pushes gear icon to the right
-
-        # Gear / settings button
-        gear_btn = QPushButton("⚙")
-        gear_btn.setFixedSize(32, 32)
-        gear_btn.setToolTip("Settings")
-        gear_btn.clicked.connect(self._open_settings)
-        top_bar.addWidget(gear_btn)
-
+        top_bar.addStretch()
+        top_bar.addWidget(self._total_label)
         layout.addLayout(top_bar)
 
-        # — Scroll area containing the image grid —
-        self._scroll = QScrollArea()
-        self._scroll.setWidgetResizable(True)
-        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # grid
+        self._view = QListView()
+        self._view.setModel(self._model)
+        self._view.setViewMode(QListView.IconMode)
+        self._view.setResizeMode(QListView.Adjust)
+        self._view.setUniformItemSizes(True)
+        self._view.setSpacing(4)
+        self._view.setMovement(QListView.Static)
+        self._view.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._view.setWordWrap(False)
+        self._view.setMouseTracking(True)
+        self._view.setIconSize(QSize(self._thumb_size, self._thumb_size))
+        self._view.setGridSize(QSize(self._thumb_size + 8, self._thumb_size + 8))
+        self._view.setStyleSheet("""
+            QListView {
+                background-color: #111111;
+                border: none;
+            }
+            QListView::item {
+                background-color: #1a1a1a;
+                border-radius: 2px;
+            }
+            QListView::item:hover {
+                border: 2px solid #5fa8ff;
+            }
+            QListView::item:selected {
+                border: 2px solid #ffffff;
+                background-color: #2a2a2a;
+            }
+        """)
+        self._view.clicked.connect(self._on_item_clicked)
+        self._view.verticalScrollBar().valueChanged.connect(
+            self._visible_timer.start
+        )
+        layout.addWidget(self._view)
+        page_layout.addWidget(right, stretch=1)
+        return page
 
-        # This is the widget that actually holds the grid layout
-        self._grid_container = QWidget()
-        self._grid = QGridLayout(self._grid_container)
-        self._grid.setSpacing(4)
-        self._grid.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+    def _build_stub_page(self, title: str, icon: str, message: str) -> QWidget:
+        """Placeholder for features not yet built."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setAlignment(Qt.AlignCenter)
+        layout.setSpacing(8)
 
-        self._scroll.setWidget(self._grid_container)
-        layout.addWidget(self._scroll)
+        icon_lbl = QLabel(icon)
+        icon_lbl.setAlignment(Qt.AlignCenter)
+        icon_lbl.setStyleSheet("font-size: 52px; margin-bottom: 8px;")
+        layout.addWidget(icon_lbl)
 
-        # Connect scroll bar to our load-more logic
-        self._scroll.verticalScrollBar().valueChanged.connect(self._on_scroll)
+        title_lbl = QLabel(title)
+        title_lbl.setAlignment(Qt.AlignCenter)
+        title_lbl.setStyleSheet(
+            "font-size: 20px; font-weight: bold; margin-bottom: 4px;"
+        )
+        layout.addWidget(title_lbl)
 
-    def _open_settings(self) -> None:
-        """Open the settings dialog. Reload images if folders changed."""
-        dialog = SettingsDialog(parent=self)
-        dialog.exec()  # blocks until dialog is closed
-        # reload in case user added/removed base folders
-        self.reload_images()
+        msg_lbl = QLabel(message)
+        msg_lbl.setAlignment(Qt.AlignCenter)
+        msg_lbl.setWordWrap(True)
+        msg_lbl.setStyleSheet("color: #777; font-size: 13px;")
+        layout.addWidget(msg_lbl)
+        return page
+
+    def _build_help_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(48, 32, 48, 32)
+        layout.setAlignment(Qt.AlignTop)
+
+        title = QLabel("Help")
+        title.setStyleSheet(
+            "font-size: 22px; font-weight: bold; margin-bottom: 20px;"
+        )
+        layout.addWidget(title)
+
+        content = QLabel("""
+<b>Browse</b><br>
+- Click any image to open it in the canvas viewer.<br>
+- Use the Small / Medium / Large buttons to change thumbnail size.<br>
+- Switch pages using the nav bar at the top.<br>
+<br>
+<b>Canvas</b><br>
+- Scroll wheel to zoom in/out. Drag to pan.<br>
+- Double-click the image to reset zoom and pan.<br>
+- Left / Right arrow keys (or ⏮ ⏭) to navigate images.<br>
+- F11 for fullscreen — Escape to exit.<br>
+- Space to play/pause animated GIFs and WebPs.<br>
+- , and . to step backward/forward one frame.<br>
+- N to hide/show the notes panel.<br>
+- Hover over the image to show the floating controls.<br>
+- Click 📌 to pin the controls so they stay visible.<br>
+<br>
+<b>Settings</b><br>
+- Add base folders — every image in them appears in the browse grid.<br>
+- Remove a base folder to stop showing its images.<br>
+        """)
+        content.setWordWrap(True)
+        content.setStyleSheet(
+            "color: #bbb; font-size: 13px; line-height: 1.8;"
+        )
+        content.setTextFormat(Qt.RichText)
+        layout.addWidget(content)
+        layout.addStretch()
+        return page
+
+    # — Page switching —
+
+    def _switch_page(self, name: str) -> None:
+        mapping = {
+            "Browse":    PAGE_BROWSE,
+            "Favorites": PAGE_FAVORITES,
+            "Artists":   PAGE_ARTISTS,
+            "Tags":      PAGE_TAGS,
+            "Pools":     PAGE_POOLS,
+            "Help":      PAGE_HELP,
+            "Settings":  PAGE_SETTINGS,
+        }
+        self._stack.setCurrentIndex(mapping.get(name, PAGE_BROWSE))
+        for btn_name, btn in self._nav_buttons.items():
+            btn.setChecked(btn_name == name)
+
+    # — Image loading —
 
     def reload_images(self) -> None:
-        """Re-scan all base folders and rebuild the grid from scratch."""
-        self._cancel_all_tasks()  # ← stop everything in flight
-        self._load_generation += 1  # ← invalidate all in-flight tasks
-        self._all_paths = []
+        paths = []
         for base in get_base_folders():
             if os.path.isdir(base):
-                self._all_paths.extend(load_images_from_folder(base, base))
-        self._all_paths.sort()
+                paths.extend(load_images_from_folder(base, base))
+        paths.sort()
+        self._model.set_paths(paths)
+        if hasattr(self, '_total_label'):
+            self._total_label.setText(f"{len(paths)} images")
+        if hasattr(self, '_tag_sidebar'):
+            self._tag_sidebar.refresh()
+        QTimer.singleShot(200, self._load_visible)
 
-        # clear the grid and reset state
-        self._loaded_count = 0
-        self._thumb_cache.clear()
-        for i in reversed(range(self._grid.count())):
-            w = self._grid.itemAt(i).widget()
-            if w:
-                w.setParent(None)
-
-        self._load_next_batch()
-
-    def _load_next_batch(self) -> None:
-        """Dispatch background load tasks for the next BATCH_SIZE images."""
-        if self._loaded_count >= len(self._all_paths): # all images loaded — nothing more to do
-            return
-        if self._pending >= MAX_CONCURRENT: # too much work in flight already — wait for some to finish
-            return
-
-        end = min(self._loaded_count + BATCH_SIZE, len(self._all_paths))
-
-        for i in range(self._loaded_count, end):
-            path = self._all_paths[i]
-
-            if path in self._thumb_cache:
-                # already decoded from a previous session or size change
-                self._add_thumb_to_grid(i, path, self._thumb_cache[path])
-                continue
-
-            # dispatch to background thread
-            task = ThumbLoader(i, path, self._thumb_size, self._load_generation)
-            task.signals.ready.connect(self._on_thumb_ready)
-            self._active_tasks.append(task)
-            self._pending += 1
-            self._pool.start(task)
-
-        self._loaded_count = end
-
-    def _cancel_all_tasks(self) -> None:
-        """Cancel all in-flight and queued tasks."""
-        for task in self._active_tasks:
-            try:
-                task.signals.ready.disconnect(self._on_thumb_ready)
-            except RuntimeError:
-                pass  # already disconnected
-            task.cancel()
-        self._active_tasks.clear()
-        self._pending = 0
-
-    def _make_thumb_button(self, path: str, index: int) -> QPushButton:
-        """Create a single thumbnail button for the grid. You can click these buttons to enter canvas view."""
-        if path not in self._thumb_cache: # decode and cache the thumbnail if we haven't already
-            raw = QPixmap(path)
-            if raw.isNull():
-                raw = QPixmap(self._thumb_size, self._thumb_size)
-                raw.fill(Qt.darkGray)
-            # square-crop, same logic as carousel
-            side = min(raw.width(), raw.height())
-            x = (raw.width() - side) // 2
-            y = (raw.height() - side) // 2
-            cropped = raw.copy(x, y, side, side).scaled(
-                self._thumb_size, self._thumb_size,
-                Qt.IgnoreAspectRatio, Qt.SmoothTransformation
-            )
-            self._thumb_cache[path] = cropped
-        btn = QPushButton()
-        btn.setIcon(QIcon(self._thumb_cache[path]))
-        btn.setIconSize(QSize(self._thumb_size, self._thumb_size))
-        btn.setFixedSize(self._thumb_size + 4, self._thumb_size + 4)
-        btn.setStyleSheet("QPushButton { border: none; background: #1a1a1a; }"
-                          "QPushButton:hover { border: 1px solid #5fa8ff; }")
-        # emit signal with all paths + this image's index
-        btn.clicked.connect(
-            lambda _checked, i=index: self.image_activated.emit(self._all_paths, i)
-        )
-        return btn
-    
-    def _add_thumb_to_grid(self, index: int, path: str, pixmap: QPixmap) -> None:
-        """Create a button for this thumbnail and place it in the grid."""
-        available_width = self._scroll.viewport().width()
-        cols = max(1, available_width // (self._thumb_size + 4))
-        row = index // cols
-        col = index % cols
-
-        btn = QPushButton()
-        btn.setIcon(QIcon(pixmap))
-        btn.setIconSize(QSize(self._thumb_size, self._thumb_size))
-        btn.setFixedSize(self._thumb_size + 4, self._thumb_size + 4)
-        btn.setStyleSheet(
-            "QPushButton { border: none; background: #1a1a1a; }"
-            "QPushButton:hover { border: 1px solid #5fa8ff; }"
-        )
-        btn.clicked.connect(
-            lambda _checked, i=index: self.image_activated.emit(self._all_paths, i)
-        )
-        self._grid.addWidget(btn, row, col)
-
-    # _on_thumb_ready — receives QImage from worker, converts to QPixmap here on main thread
-    def _on_thumb_ready(self, index: int, path: str, image: QImage, generation: int) -> None:
-        if generation != self._load_generation: # old generation, ignore
-            return
-            
-        self._pending = max(0, self._pending - 1)
-
-        # remove this task from active list now that it's done
-        self._active_tasks = [t for t in self._active_tasks if t.generation == self._load_generation]
-        
-        # convert to QPixmap here, on the main thread
-        pixmap = QPixmap.fromImage(image)
-        self._thumb_cache[path] = pixmap
-        self._add_thumb_to_grid(index, path, pixmap)
-
-        if self._pending == 0:
-            self._fill_viewport_if_needed()
-            # after a batch finishes, check if we're still near the bottom and need more.
-            bar = self._scroll.verticalScrollBar()
-            if bar.maximum() == 0: # no scrollbar yet
-                return
-            if bar.value() >= bar.maximum() - 300:
-                self._load_timer.start()
-
-    def _on_scroll(self, value: int) -> None:
-        """Called every time the scroll position changes."""
-        if self._pending > 0: # already loading, don't queue another batch yet
-            return
-        bar = self._scroll.verticalScrollBar()
-        # if we're within 300px of the bottom, queue a batch load
-        if value >= bar.maximum() - 300:
-            # debounce: restart the timer instead of calling directly.
-            # this prevents _load_next_batch from firing 20 times in one scroll gesture
-            self._load_timer.start()
-
-    def _fill_viewport_if_needed(self) -> None:
-        """
-        If the grid content is shorter than the visible area,
-        load another batch immediately — no scrolling needed.
-        
-        This handles the case where 50 images don't fill a large window.
-        """
-        content_height = self._grid_container.sizeHint().height()
-        viewport_height = self._scroll.viewport().height()
-
-        if content_height < viewport_height and self._loaded_count < len(self._all_paths):
-            self._load_next_batch()
+    def _on_item_clicked(self, index) -> None:
+        self.image_activated.emit(self._model.all_paths(), index.row())
 
     def _set_thumb_size(self, size: int) -> None:
-        """Change the thumbnail size and rebuild the grid."""
-        if size == self._thumb_size: # user clicked the already-active size
+        self._pending_size = size
+        self._resize_timer.start()
+
+    def _apply_thumb_size(self) -> None:
+        if self._pending_size == self._thumb_size:
             return
-        self._cancel_all_tasks()  # sets cancel flag on all tasks, clears list, sets _pending = 0
-        self._load_generation += 1  # when a new load is started, invalidate all in-flight tasks by incrementing the generation counter
-        self._thumb_size = size
-        self._thumb_cache.clear() # cached pixmaps are no longer valid at the new size, clear them
+        self._thumb_size = self._pending_size
+        self._model.set_thumb_size(self._thumb_size)
+        self._view.setIconSize(QSize(self._thumb_size, self._thumb_size))
+        self._view.setGridSize(QSize(self._thumb_size + 8, self._thumb_size + 8))
+        QTimer.singleShot(50, self._load_visible)
 
-        # clear all existing widgets from the grid
-        for i in reversed(range(self._grid.count())):
-            w = self._grid.itemAt(i).widget()
-            if w:
-                w.setParent(None)
-
-        # reset and reload from scratch at the new size
-        self._loaded_count = 0
-        self._load_next_batch()
-        # resizing instead of rebuilding the grid would be more efficient, but it's more complex to implement and not worth the effort for this prototype.
-
-    def resizeEvent(self, event) -> None:
-        """Reflow the grid when the window is resized."""
-        super().resizeEvent(event)
-        if not self.isVisible():  # don't reflow if we're not the active page
+    def _load_visible(self) -> None:
+        if self._model.rowCount() == 0:
             return
-        self._cancel_all_tasks()  # cancel any in-flight tasks, since the grid is about to be rebuilt
-        self._load_generation += 1  # invalidate all in-flight tasks
-        self._loaded_count = 0
-        for i in reversed(range(self._grid.count())):
-            w = self._grid.itemAt(i).widget()
-            if w:
-                w.setParent(None)
-        self._load_next_batch() 
+
+        vp_rect = self._view.viewport().rect()
+        top_index = self._view.indexAt(vp_rect.topLeft())
+
+        if not top_index.isValid():
+            # view hasn't laid out yet — retry in 100ms
+            QTimer.singleShot(100, self._load_visible)
+            return
+
+        bottom_index = self._view.indexAt(vp_rect.bottomRight())
+        first = top_index.row()
+        last = (
+            bottom_index.row()
+            if bottom_index.isValid()
+            else min(self._model.rowCount() - 1, first + 50)
+        )
+
+        self._model.prioritize_visible(first, last)
+
+        # load visible items + one screen of buffer above and below
+        buffer = max(20, last - first + 1)
+        load_first = max(0, first - buffer)
+        load_last = min(self._model.rowCount() - 1, last + buffer)
+
+        for row in range(load_first, load_last + 1):
+            self._model.request_thumbnail(row)
+
+    def _on_tag_filter(self, tag_name: str) -> None:
+        """Filter grid to images matching all active tags."""
+        active = self._tag_sidebar.get_active_tags()
+        if not active:
+            self.reload_images()
+            return
+        from services.db_handler import search_images_by_tags, get_base_folders
+        import os
+        # search_images_by_tags returns relative paths — resolve to absolute
+        bases = get_base_folders()
+        rel_paths = search_images_by_tags(active)
+        abs_paths = []
+        for rel in rel_paths:
+            for base in bases:
+                candidate = os.path.normpath(os.path.join(base, rel))
+                if os.path.exists(candidate):
+                    abs_paths.append(candidate)
+                    break
+        abs_paths.sort()
+        self._model.set_paths(abs_paths)
+        self._total_label.setText(f"{len(abs_paths)} images")
+        QTimer.singleShot(200, self._load_visible)
+
+    def _on_tag_search(self, query: str) -> None:
+        """Search by space-separated tag names."""
+        if not query:
+            self.reload_images()
+            return
+        tags = query.split()
+        self._on_tag_filter_list(tags)
