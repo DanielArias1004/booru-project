@@ -2,6 +2,7 @@
 from PySide6.QtWidgets import QWidget, QHBoxLayout, QPushButton, QScrollArea, QSizePolicy
 from PySide6.QtGui import QPixmap, QIcon
 from PySide6.QtCore import QSize, Qt
+from services.thumb_cache import get_or_create_thumbnail
 
 THUMB_SIZE = 64           # size of non-focused thumbnails
 FOCUS_SIZE = 96           # size of the centered/current thumbnail
@@ -38,7 +39,7 @@ class CarouselWidget(QWidget):
         if path not in self._thumb_cache:
             raw = QPixmap(path) # load the image from disk (this is slow, so we cache it)
             if raw.isNull(): # if the image failed to load (e.g. file not found, unsupported format), create a blank fallback pixmap to avoid crashing
-                raw = QPixmap(FOCUS_SIZE, FOCUS_SIZE)
+                raw = QPixmap(get_or_create_thumbnail(path) or path)
                 raw.fill(Qt.darkGray)
             self._thumb_cache[path] = _square_crop(raw, FOCUS_SIZE) # crop and cache at full size and scale down later if needed. cheaper to crop once and scale later since cropping is more expensive. otherwise we would scale and then need to crop both the small and full quality images separately.
         cached = self._thumb_cache[path]

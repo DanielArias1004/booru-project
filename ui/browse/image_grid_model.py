@@ -1,62 +1,71 @@
 # ui/browse/image_grid_model.py
 import heapq
 import os
+from collections import OrderedDict
+
 from PySide6.QtCore import (
     QAbstractListModel, QModelIndex, Qt, QSize,
     QObject, QRunnable, QThreadPool, QTimer, Signal
 )
 from PySide6.QtGui import QPixmap, QImage, QColor, QIcon
-import threading
-from collections import OrderedDict
+
+from services.thumb_cache import get_or_create_thumbnail
+
+import logging
+logger = logging.getLogger(__name__)
 
 THUMB_SIZE_DEFAULT = 150
-MAX_ACTIVE = 8
+CACHE_PIXELS = 256      # thumbnails on disk are 256px; the view scales them down
+MAX_IN_FLIGHT = 4       # how many thumbnails load at once
+
 
 class _LoadSignals(QObject):
-    ready = Signal(int, QImage, int)
+    """ONE of these lives for the whole life of the model.
+    Worker threads emit through it; Qt delivers the signal safely
+    to the main thread."""
+    ready = Signal(int, QImage, int)   # row, image, generation
+
+
+class _Generation:
+    """Shared counter. When the list changes we bump it, and any task
+    started under an older number sees it is stale and quits early.
+    (Replaces the per-task cancel Event.)"""
+    def __init__(self):
+        self.value = 0
 
 
 class _ThumbTask(QRunnable):
-    def __init__(self, row: int, path: str, size: int, generation: int):
+    def __init__(self, row: int, path: str, generation: int,
+                 gen_ref: _Generation, signals: _LoadSignals):
         super().__init__()
         self.row = row
         self.path = path
-        self.size = size
         self.generation = generation
-        self.signals = _LoadSignals()
-        self._cancelled = threading.Event()
+        self._gen_ref = gen_ref
+        self._signals = signals
         self.setAutoDelete(True)
 
-    def cancel(self) -> None:
-        self._cancelled.set()
+    def _stale(self) -> bool:
+        return self._gen_ref.value != self.generation
 
     def run(self) -> None:
-        if self._cancelled.is_set():
+        if self._stale():
             return
-
-        from services.thumb_cache import get_or_create_thumbnail
-        thumb_path = get_or_create_thumbnail(self.path, self.size)
-
-        if self._cancelled.is_set():
-            return
-
-        if thumb_path is None:
-            # fallback: gray placeholder
-            img = QImage(self.size, self.size, QImage.Format_RGB32)
-            img.fill(QColor("#333333").rgb())
-            self.signals.ready.emit(self.row, img, self.generation)
-            return
-
-        # load the tiny cached thumbnail — very fast
-        img = QImage(thumb_path)
-        if img.isNull():
-            img = QImage(self.size, self.size, QImage.Format_RGB32)
-            img.fill(QColor("#333333").rgb())
-
-        if self._cancelled.is_set():
-            return
-
-        self.signals.ready.emit(self.row, img.convertToFormat(QImage.Format_RGB32), self.generation)
+        try:
+            thumb_path = get_or_create_thumbnail(self.path)
+            if self._stale():
+                return
+            img = QImage(thumb_path) if thumb_path else QImage()
+            if img.isNull():
+                img = QImage(CACHE_PIXELS, CACHE_PIXELS, QImage.Format_RGB32)
+                img.fill(QColor("#333333"))
+            else:
+                img = img.convertToFormat(QImage.Format_RGB32)
+        except Exception:
+            logger.exception("Thumbnail task failed for %s", self.path)
+            img = QImage(CACHE_PIXELS, CACHE_PIXELS, QImage.Format_RGB32)
+            img.fill(QColor("#333333"))
+        self._signals.ready.emit(self.row, img, self.generation)
 
 
 class ImageGridModel(QAbstractListModel):
@@ -64,29 +73,30 @@ class ImageGridModel(QAbstractListModel):
         super().__init__(parent)
         self._paths: list[str] = []
         self._thumb_size: int = THUMB_SIZE_DEFAULT
-        self._pixmap_cache = OrderedDict()
-        self._cache_limit = 300
+
+        self._icon_cache: OrderedDict[int, QIcon] = OrderedDict()
+        self._cache_limit = 400
+
         self._loading: set[int] = set()
-        self._pending_requests = []
+        self._pending: list[tuple[int, int]] = []   # heap of (priority, row)
+        self._pending_rows: set[int] = set()        # fast "is it queued?" check
         self._queue_center = 0
-        self._generation: int = 0
-        self._active_tasks: list[_ThumbTask] = []
 
-        # single placeholder icon reused for all unloaded cells
-        self._placeholder_icon: QIcon = self._make_placeholder(THUMB_SIZE_DEFAULT)
+        self._gen = _Generation()
+        self._signals = _LoadSignals(self)
+        self._signals.ready.connect(self._on_loaded)
 
-        self._dispatch_timer = QTimer()
+        pix = QPixmap(CACHE_PIXELS, CACHE_PIXELS)
+        pix.fill(QColor("#2a2a2a"))
+        self._placeholder_icon = QIcon(pix)
+
+        self._dispatch_timer = QTimer(self)
         self._dispatch_timer.setSingleShot(True)
         self._dispatch_timer.setInterval(80)
         self._dispatch_timer.timeout.connect(self._dispatch_pending)
 
-        self._pool = QThreadPool()
-        self._pool.setMaxThreadCount(4) # maybe even 2
-
-    def _make_placeholder(self, size: int) -> QIcon:
-        pix = QPixmap(size, size)
-        pix.fill(QColor("#2a2a2a"))
-        return QIcon(pix)
+        self._pool = QThreadPool(self)
+        self._pool.setMaxThreadCount(MAX_IN_FLIGHT)
 
     # — QAbstractListModel interface —
 
@@ -99,10 +109,8 @@ class ImageGridModel(QAbstractListModel):
         row = index.row()
 
         if role == Qt.DecorationRole:
-            if row in self._pixmap_cache:
-                return QIcon(self._pixmap_cache[row])
-
-            return self._placeholder_icon
+            icon = self._icon_cache.get(row)
+            return icon if icon is not None else self._placeholder_icon
 
         if role == Qt.SizeHintRole:
             s = self._thumb_size + 4
@@ -115,41 +123,16 @@ class ImageGridModel(QAbstractListModel):
 
     # — Public API —
 
-    def request_thumbnail(self, row: int):
-        self._request_load(row)
-
-    def prioritize_visible(self, first: int, last: int):
-        self._pending_requests.clear()
-
-        center = (first + last) // 2
-
-        # Store the current viewport center
-        self._queue_center = center
-
     def set_paths(self, paths: list[str]) -> None:
-        self._cancel_all()
-        self._generation += 1
-        self._pixmap_cache.clear()
-        self._loading.clear()
+        self._reset_loading_state()
         self.beginResetModel()
         self._paths = paths
         self.endResetModel()
 
     def set_thumb_size(self, size: int) -> None:
-        if size == self._thumb_size:
-            return
-        self._cancel_all()
-        self._generation += 1
+        # Thumbnails are cached at 256px and the view scales them to its
+        # iconSize, so a size change needs NO reloading. Just remember it.
         self._thumb_size = size
-        self._pixmap_cache.clear()
-        self._loading.clear()
-        self._placeholder_icon = self._make_placeholder(size)
-        if self._paths:
-            self.dataChanged.emit(
-                self.index(0),
-                self.index(len(self._paths) - 1),
-                [Qt.DecorationRole, Qt.SizeHintRole]
-            )
 
     def path_at(self, row: int) -> str:
         return self._paths[row] if 0 <= row < len(self._paths) else ""
@@ -157,77 +140,51 @@ class ImageGridModel(QAbstractListModel):
     def all_paths(self) -> list[str]:
         return list(self._paths)
 
+    def prioritize_visible(self, first: int, last: int) -> None:
+        self._pending.clear()
+        self._pending_rows.clear()
+        self._queue_center = (first + last) // 2
+
+    def request_thumbnail(self, row: int) -> None:
+        if not (0 <= row < len(self._paths)):
+            return
+        if row in self._icon_cache or row in self._loading or row in self._pending_rows:
+            return
+        heapq.heappush(self._pending, (abs(row - self._queue_center), row))
+        self._pending_rows.add(row)
+        if not self._dispatch_timer.isActive():
+            self._dispatch_timer.start()
+
     # — Internal —
 
-    def _request_load(self, row: int):
-        if row in self._pixmap_cache:
-            return
-        if row in self._loading:
-            return
-        for _, existing_row in self._pending_requests:
-            if existing_row == row:
-                return
-        priority = abs(row - self._queue_center)
-        heapq.heappush(
-            self._pending_requests,
-            (priority, row)
-        )
-        self._dispatch_timer.start()
+    def _reset_loading_state(self) -> None:
+        self._gen.value += 1          # invalidates every task already queued/running
+        self._pool.clear()            # drops tasks that haven't started yet
+        self._icon_cache.clear()
+        self._loading.clear()
+        self._pending.clear()
+        self._pending_rows.clear()
+        self._dispatch_timer.stop()
 
-    def _dispatch_pending(self):
-        print("QUEUE SIZE:", len(self._pending_requests))
-        available = MAX_ACTIVE - len(self._loading)
-        if available <= 0:
-            return
-        while available > 0 and self._pending_requests:
-            priority, row = heapq.heappop(
-                self._pending_requests
-            )
-
-            if row in self._pixmap_cache:
+    def _dispatch_pending(self) -> None:
+        while self._pending and len(self._loading) < MAX_IN_FLIGHT:
+            _, row = heapq.heappop(self._pending)
+            self._pending_rows.discard(row)
+            if row >= len(self._paths) or row in self._icon_cache or row in self._loading:
                 continue
-            if row in self._loading:
-                continue
-            if row >= len(self._paths):
-                continue
-
             self._loading.add(row)
-
-            task = _ThumbTask(
-                row,
-                self._paths[row],
-                self._thumb_size,
-                self._generation,
-            )
-
-            task.signals.ready.connect(
-                self._on_loaded
-            )
-
-            self._active_tasks.append(task)
+            task = _ThumbTask(row, self._paths[row], self._gen.value,
+                              self._gen, self._signals)
             self._pool.start(task)
-            available -= 1
 
     def _on_loaded(self, row: int, image: QImage, generation: int) -> None:
-        if generation != self._generation:
-            return
+        if generation != self._gen.value:
+            return   # result from before the list/size changed: ignore
         self._loading.discard(row)
-        self._pixmap_cache[row] = QPixmap.fromImage(image)
-        self._pixmap_cache.move_to_end(row)
-        while len(self._pixmap_cache) > self._cache_limit:
-            self._pixmap_cache.popitem(last=False)
+        self._icon_cache[row] = QIcon(QPixmap.fromImage(image))
+        self._icon_cache.move_to_end(row)
+        while len(self._icon_cache) > self._cache_limit:
+            self._icon_cache.popitem(last=False)
         idx = self.index(row)
         self.dataChanged.emit(idx, idx, [Qt.DecorationRole])
-        self._dispatch_timer.start()
-
-    def _cancel_all(self) -> None:
-        for task in self._active_tasks:
-            try:
-                task.signals.ready.disconnect(self._on_loaded)
-            except RuntimeError:
-                pass
-            task.cancel()
-        self._active_tasks.clear()
-        self._loading.clear()
-        self._pending_requests.clear()
-        self._dispatch_timer.stop()
+        self._dispatch_pending()   # a slot just freed up, so refill immediately

@@ -29,6 +29,7 @@ class ImageView(QWidget):
     """
     mouse_activity = Signal()   # emitted on any mouse interaction
     zoom_changed = Signal(float)  # emitted when zoom level changes
+    resized = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -157,6 +158,7 @@ class ImageView(QWidget):
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self.update()
+        self.resized.emit()
 
 
 class FloatingControls(QFrame):
@@ -393,7 +395,6 @@ class CanvasWidget(QWidget):
         self._image_view = ImageView()
         self._image_view.mouse_activity.connect(self._on_mouse_activity)
         self._image_view.zoom_changed.connect(self._on_zoom_changed)
-        content_layout.addWidget(self._image_view, stretch=1)
 
         # sidebar with resize handle
         self._sidebar = CanvasSidebar()
@@ -454,6 +455,7 @@ class CanvasWidget(QWidget):
             },
             parent=self._image_view  # overlay on the image, not the whole canvas
         )
+        self._image_view.resized.connect(self._reposition_controls)
 
         # — Keyboard shortcuts —
         QShortcut(QKeySequence("Left"),   self, self.show_previous)

@@ -45,7 +45,9 @@ CREATE TABLE IF NOT EXISTS pool_images (
 
 CREATE TABLE IF NOT EXISTS folders (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    path TEXT UNIQUE NOT NULL
+    base_folder TEXT NOT NULL,
+    path TEXT NOT NULL,
+    UNIQUE(base_folder, path)
 );
 
 CREATE INDEX IF NOT EXISTS idx_images_file_path ON images(file_path);

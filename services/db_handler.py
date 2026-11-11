@@ -113,26 +113,13 @@ def add_images_batch(file_paths: list[str]) -> None:
     except Exception:
         logger.exception("Failed to batch-insert %d images", len(file_paths))
 
-def set_favorite(image_id, is_favorite=True):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE images SET favorite = ? WHERE id = ?;",
-        (1 if is_favorite else 0, image_id)
-    )
-    conn.commit()
-    conn.close()
 
-
-def get_favorites():
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT id, file_path FROM images WHERE favorite = 1;"
-    )
-    results = cur.fetchall()
-    conn.close()
-    return results
+def get_favorites() -> list[str]:
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT file_path FROM images WHERE favorite = 1 ORDER BY file_path;"
+        ).fetchall()
+    return [r[0] for r in rows]
 
 
 def add_note(image_id, content, created_at):
@@ -219,17 +206,6 @@ def add_alias(tag_id, alias_name):
     cur.execute(
         "INSERT OR IGNORE INTO tag_aliases (tag_id, alias_name) VALUES (?, ?);",
         (tag_id, alias_name)
-    )
-    conn.commit()
-    conn.close()
-
-
-def add_tag_to_image(image_id, tag_id):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT OR IGNORE INTO image_tags (image_id, tag_id) VALUES (?, ?);",
-        (image_id, tag_id)
     )
     conn.commit()
     conn.close()
@@ -346,5 +322,90 @@ def get_image_tags_autocomplete(prefix: str) -> list[str]:
             (prefix + "%",)
         ).fetchall()
     return [r[0] for r in rows]
+
+# --- Pools (user-made playlists) ---
+
+def create_pool(name: str) -> int | None:
+    """Create a pool. Returns its id, or None if the name is empty or taken."""
+    name = name.strip()
+    if not name:
+        return None
+    try:
+        with get_db() as conn:
+            cur = conn.execute("INSERT INTO pools (name) VALUES (?);", (name,))
+            return cur.lastrowid
+    except sqlite3.IntegrityError:   # name is UNIQUE in the schema
+        return None
+
+
+def rename_pool(pool_id: int, name: str) -> bool:
+    name = name.strip()
+    if not name:
+        return False
+    try:
+        with get_db() as conn:
+            conn.execute("UPDATE pools SET name = ? WHERE id = ?;", (name, pool_id))
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+
+def delete_pool(pool_id: int) -> None:
+    # SQLite doesn't enforce foreign keys by default, so clean up pool_images ourselves
+    with get_db() as conn:
+        conn.execute("DELETE FROM pool_images WHERE pool_id = ?;", (pool_id,))
+        conn.execute("DELETE FROM pools WHERE id = ?;", (pool_id,))
+
+
+def get_pools() -> list[dict]:
+    with get_db() as conn:
+        rows = conn.execute("""
+            SELECT p.id, p.name, COUNT(pi.image_id)
+            FROM pools p
+            LEFT JOIN pool_images pi ON pi.pool_id = p.id
+            GROUP BY p.id
+            ORDER BY p.name COLLATE NOCASE
+        """).fetchall()
+    return [{"id": r[0], "name": r[1], "count": r[2]} for r in rows]
+
+
+def get_pool_images(pool_id: int) -> list[str]:
+    with get_db() as conn:
+        rows = conn.execute("""
+            SELECT i.file_path
+            FROM pool_images pi
+            JOIN images i ON i.id = pi.image_id
+            WHERE pi.pool_id = ?
+            ORDER BY pi.position, i.file_path
+        """, (pool_id,)).fetchall()
+    return [r[0] for r in rows]
+
+
+def add_image_to_pool(pool_id: int, image_id: int) -> None:
+    with get_db() as conn:
+        next_pos = conn.execute(
+            "SELECT COALESCE(MAX(position), -1) + 1 FROM pool_images WHERE pool_id = ?;",
+            (pool_id,)
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT OR IGNORE INTO pool_images (pool_id, image_id, position) VALUES (?, ?, ?);",
+            (pool_id, image_id, next_pos)
+        )
+
+
+def remove_image_from_pool(pool_id: int, image_id: int) -> None:
+    with get_db() as conn:
+        conn.execute(
+            "DELETE FROM pool_images WHERE pool_id = ? AND image_id = ?;",
+            (pool_id, image_id)
+        )
+
+
+def get_pool_ids_for_image(image_id: int) -> set[int]:
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT pool_id FROM pool_images WHERE image_id = ?;", (image_id,)
+        ).fetchall()
+    return {r[0] for r in rows}
 
 # Additional DB functions (e.g., queries) can be added here

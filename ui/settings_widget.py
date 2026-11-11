@@ -37,7 +37,7 @@ class SettingsWidget(QWidget):
         hint = QLabel(
             "All images inside these folders appear in the browse grid."
         )
-        hint.setStyleSheet("color: #777; margin-bottom: 8px; font-size: 12px;")
+        hint.setStyleSheet("color: #999; margin-bottom: 8px; font-size: 12px;")
         layout.addWidget(hint)
 
         self._folder_container = QWidget()
@@ -64,7 +64,7 @@ class SettingsWidget(QWidget):
         folders = get_base_folders()
         if not folders:
             empty = QLabel("No base folders added yet.")
-            empty.setStyleSheet("color: #555; padding: 4px;")
+            empty.setStyleSheet("color: #999; padding: 4px;")
             self._folder_layout.addWidget(empty)
             return
 

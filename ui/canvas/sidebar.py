@@ -4,18 +4,29 @@ from datetime import datetime
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QTextEdit, QScrollArea, QFrame,
-    QLineEdit, QComboBox, QSizeGrip, QSizePolicy,
-    QCompleter
+    QPushButton, QTextEdit, QScrollArea, QMenu,
+    QInputDialog, QMessageBox
 )
-from PySide6.QtCore import Qt, Signal, QStringListModel, QSize
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
 
 from services.db_handler import (
-    set_favorite, get_favorite,
-    get_image_id_by_path,
-    get_latest_note, add_note
+    set_favorite, get_favorite, get_image_id_by_path,
+    get_latest_note, add_note,
+    get_pools, create_pool, add_image_to_pool,
+    remove_image_from_pool, get_pool_ids_for_image
 )
+
+_BTN_STYLE = """
+    QPushButton { background: #2a2a2a; color: #ddd; border: 1px solid #444;
+                  border-radius: 6px; padding: 7px; font-size: 13px; }
+    QPushButton:hover { background: #333; }
+"""
+_FAV_ON_STYLE = """
+    QPushButton { background: #3a1a1a; color: #ff6b6b; border: 1px solid #ff6b6b55;
+                  border-radius: 6px; padding: 7px; font-size: 13px; }
+    QPushButton:hover { background: #4a2020; }
+"""
 
 class CollapsibleSection(QWidget):
     """
@@ -132,7 +143,7 @@ class CanvasSidebar(QWidget):
         self._main_layout.setContentsMargins(0, 0, 0, 0)
         self._main_layout.setSpacing(0)
 
-        self._build_favorites_section()
+        self._build_action_buttons()
         self._build_file_info_section()
         self._build_notes_section()
 
@@ -142,23 +153,22 @@ class CanvasSidebar(QWidget):
 
     # — Section builders —
 
-    def _build_favorites_section(self) -> None:
-        section = CollapsibleSection("Favorites")
-        self._fav_btn = QPushButton("♡  Add to Favorites")
-        self._fav_btn.setStyleSheet("""
-            QPushButton {
-                background: #2a2a2a;
-                color: #ccc;
-                border: 1px solid #444;
-                border-radius: 6px;
-                padding: 6px;
-                font-size: 13px;
-            }
-            QPushButton:hover { background: #333; color: #ff6b6b; }
-        """)
+    def _build_action_buttons(self) -> None:
+        holder = QWidget()
+        row = QHBoxLayout(holder)
+        row.setContentsMargins(8, 8, 8, 8)
+        row.setSpacing(6)
+
+        self._fav_btn = QPushButton()
         self._fav_btn.clicked.connect(self._toggle_favorite)
-        section.add_widget(self._fav_btn)
-        self._main_layout.addWidget(section)
+        self._pool_btn = QPushButton("＋  Pool")
+        self._pool_btn.setStyleSheet(_BTN_STYLE)
+        self._pool_btn.clicked.connect(self._show_pool_menu)
+
+        row.addWidget(self._fav_btn, stretch=1)
+        row.addWidget(self._pool_btn, stretch=1)
+        self._main_layout.addWidget(holder)
+        self._update_fav_button()
 
     def _build_file_info_section(self) -> None:
         section = CollapsibleSection("File Info")
@@ -170,7 +180,7 @@ class CanvasSidebar(QWidget):
             row_layout.setSpacing(4)
             key_lbl = QLabel(f"{key}:")
             key_lbl.setFixedWidth(64)
-            key_lbl.setStyleSheet("color: #666; font-size: 11px;")
+            key_lbl.setStyleSheet("color: #999; font-size: 11px;")
             val_lbl = QLabel("—")
             val_lbl.setWordWrap(True)
             val_lbl.setStyleSheet("color: #ccc; font-size: 11px;")
@@ -401,27 +411,38 @@ class CanvasSidebar(QWidget):
     def _update_fav_button(self) -> None:
         if self._is_favorite:
             self._fav_btn.setText("♥  Favorited")
-            self._fav_btn.setStyleSheet("""
-                QPushButton {
-                    background: #3a1a1a;
-                    color: #ff6b6b;
-                    border: 1px solid #ff6b6b55;
-                    border-radius: 6px;
-                    padding: 6px;
-                    font-size: 13px;
-                }
-                QPushButton:hover { background: #4a2020; }
-            """)
+            self._fav_btn.setStyleSheet(_FAV_ON_STYLE)
         else:
-            self._fav_btn.setText("♡  Add to Favorites")
-            self._fav_btn.setStyleSheet("""
-                QPushButton {
-                    background: #2a2a2a;
-                    color: #ccc;
-                    border: 1px solid #444;
-                    border-radius: 6px;
-                    padding: 6px;
-                    font-size: 13px;
-                }
-                QPushButton:hover { background: #333; color: #ff6b6b; }
-            """)
+            self._fav_btn.setText("♡  Favorite")
+            self._fav_btn.setStyleSheet(_BTN_STYLE)
+
+    def _show_pool_menu(self) -> None:
+        if not self._image_id:
+            return
+        member_of = get_pool_ids_for_image(self._image_id)
+        menu = QMenu(self)
+        for pool in get_pools():
+            action = menu.addAction(pool["name"])
+            action.setCheckable(True)
+            action.setChecked(pool["id"] in member_of)
+            action.setData(pool["id"])
+        menu.addSeparator()
+        new_action = menu.addAction("＋  New pool…")
+
+        chosen = menu.exec(self._pool_btn.mapToGlobal(self._pool_btn.rect().bottomLeft()))
+        if chosen is None:
+            return
+        if chosen == new_action:
+            name, ok = QInputDialog.getText(self, "New Pool", "Pool name:")
+            if ok and name.strip():
+                pool_id = create_pool(name)
+                if pool_id is None:
+                    QMessageBox.warning(self, "New Pool", "That name is empty or already taken.")
+                else:
+                    add_image_to_pool(pool_id, self._image_id)
+            return
+        pool_id = chosen.data()
+        if pool_id in member_of:
+            remove_image_from_pool(pool_id, self._image_id)
+        else:
+            add_image_to_pool(pool_id, self._image_id)
