@@ -1,5 +1,4 @@
 # ui/settings_widget.py
-import os
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QFileDialog
@@ -35,7 +34,7 @@ class SettingsWidget(QWidget):
         layout.addWidget(section)
 
         hint = QLabel(
-            "All images inside these folders appear in the browse grid."
+            "These folders are the roots of the folder tree on the Browse page."
         )
         hint.setStyleSheet("color: #999; margin-bottom: 8px; font-size: 12px;")
         layout.addWidget(hint)
@@ -55,11 +54,22 @@ class SettingsWidget(QWidget):
 
         self._refresh()
 
-    def _refresh(self) -> None:
+    def _clear_rows(self) -> None:
+        """Remove every row from the folder list.
+
+        deleteLater() lets Qt delete each widget once it's safe. This is called
+        from a remove button's own click handler, so deleting the row immediately
+        would destroy the button while it's still running its handler.
+        """
         for i in reversed(range(self._folder_layout.count())):
             w = self._folder_layout.itemAt(i).widget()
             if w:
-                w.setParent(None)
+                self._folder_layout.removeWidget(w)
+                w.hide()
+                w.deleteLater()
+
+    def _refresh(self) -> None:
+        self._clear_rows()
 
         folders = get_base_folders()
         if not folders:
@@ -70,9 +80,9 @@ class SettingsWidget(QWidget):
 
         for folder in folders:
             row = QWidget()
-            row.setStyleSheet(
-                "background: #1e1e1e; border-radius: 4px;"
-            )
+            row.setObjectName("folderRow")
+            # "#folderRow { ... }" styles only this widget, not its children
+            row.setStyleSheet("#folderRow { background: #1e1e1e; border-radius: 4px; }")
             row_layout = QHBoxLayout(row)
             row_layout.setContentsMargins(8, 4, 4, 4)
 
@@ -84,10 +94,10 @@ class SettingsWidget(QWidget):
             rem.setFixedSize(26, 26)
             rem.setToolTip("Remove this base folder")
             rem.setStyleSheet(
-                "QPushButton { background: transparent; color: #777; border: none; }"
+                "QPushButton { background: transparent; color: #999; border: none; }"
                 "QPushButton:hover { color: #ff6b6b; }"
             )
-            rem.clicked.connect(lambda _, f=folder: self._remove_folder(f))
+            rem.clicked.connect(lambda _checked=False, f=folder: self._remove_folder(f))
             row_layout.addWidget(rem)
 
             self._folder_layout.addWidget(row)
@@ -105,6 +115,6 @@ class SettingsWidget(QWidget):
         self.folders_changed.emit()
 
     def showEvent(self, event) -> None:
-        """Refresh folder list every time this page becomes visible."""
+        """Refresh the folder list every time this page becomes visible."""
         super().showEvent(event)
         self._refresh()
